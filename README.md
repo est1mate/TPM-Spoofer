@@ -23,9 +23,7 @@ This tool performs operations similar to the Linux `tpm2_evictcontrol` command.
 ## Requirements
 
 - Go 1.19 or higher
-- TPM 2.0 enabled in BIOS:
-  - Intel: PTT
-  - AMD: fTPM
+- TPM 2.0 enabled
 - Administrator privileges
 
 ---
