@@ -15,7 +15,7 @@ This tool performs operations similar to the Linux `tpm2_evictcontrol` command.
 
 - Manage TPM 2.0 persistent handles
 - Modify Endorsement Key (EK) handle
-- 
+
 ---
 
 ## Requirements
