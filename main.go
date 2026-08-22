@@ -7,13 +7,19 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -83,7 +89,124 @@ var (
 	oSec []byte
 	eSec []byte
 	lSec []byte
+	oldSerial string
+	newSerial string
 )
+
+const (
+	PROCESS_QUERY_INFORMATION = 0x0400
+	PROCESS_VM_READ          = 0x0010
+)
+
+var (
+	kernel32               = windows.NewLazySystemDLL("kernel32.dll")
+	procGetConsoleWindow   = kernel32.NewProc("GetConsoleWindow")
+	procGetWindowThreadProcessId = kernel32.NewProc("GetWindowThreadProcessId")
+)
+
+type _STARTUPINFOW struct {
+	Cb            uint32
+	Reserved      *uint16
+	Desktop       *uint16
+	Title         *uint16
+	X             uint32
+	Y             uint32
+	XSize         uint32
+	YSize         uint32
+	XCountChars   uint32
+	YCountChars   uint32
+	FillAttribute uint32
+	Flags         uint32
+	ShowWindow    uint16
+	CbReserved2   uint16
+	Reserved2     *byte
+	StdInput      windows.Handle
+	StdOutput     windows.Handle
+	StdError      windows.Handle
+}
+
+type _PROCESS_INFORMATION struct {
+	Process   windows.Handle
+	Thread    windows.Handle
+	ProcessId uint32
+	ThreadId  uint32
+}
+
+const (
+	SW_HIDE            = 0
+	STARTF_USESHOWWINDOW = 0x00000001
+	CREATE_UNICODE_ENVIRONMENT = 0x00000400
+)
+
+func isElevated() bool {
+	var token windows.Token
+	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
+	if err != nil {
+		return false
+	}
+	defer token.Close()
+
+	var elevation uint32
+	var returnedLen uint32
+	err = windows.GetTokenInformation(token, windows.TokenElevation, (*byte)(unsafe.Pointer(&elevation)), uint32(unsafe.Sizeof(elevation)), &returnedLen)
+	if err != nil {
+		return false
+	}
+	return elevation != 0
+}
+
+func restartAsAdmin() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	verb := "runas"
+	cwd, _ := os.Getwd()
+
+	exePtr, err := windows.UTF16PtrFromString(exe)
+	if err != nil {
+		return err
+	}
+	verbPtr, err := windows.UTF16PtrFromString(verb)
+	if err != nil {
+		return err
+	}
+	cwdPtr, err := windows.UTF16PtrFromString(cwd)
+	if err != nil {
+		return err
+	}
+
+	windows.ShellExecute(0, verbPtr, exePtr, nil, cwdPtr, 1)
+	return nil
+}
+
+func runElevatedPowerShell(command string) error {
+	psCmd := fmt.Sprintf("Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command \"%s\"' -Verb RunAs -Wait", command)
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd)
+	return cmd.Run()
+}
+
+func getTPMSerial() string {
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", "(Get-Tpm).ManufacturerId")
+	output, err := cmd.Output()
+	if err != nil {
+		return "Unknown"
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func clearTPM() error {
+	fmt.Println("[*] Requesting TPM clear via elevated PowerShell...")
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Clear-Tpm")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("[!] TPM clear command output: %s\n", string(output))
+		return fmt.Errorf("failed to clear TPM: %v", err)
+	}
+	fmt.Println("[+] TPM cleared successfully")
+	return nil
+}
 
 func hasNv(t transport.TPM, h tpm2.TPMHandle) bool {
 	_, err := tpm2.NVReadPublic{NVIndex: h}.Execute(t)
@@ -504,10 +627,49 @@ func brkLck(t transport.TPM) error {
 }
 
 func main() {
-	d := make([]byte, 32)
-	if _, err := rand.Read(d); err != nil {
+	if runtime.GOOS != "windows" {
+		fmt.Println("[!] This tool only works on Windows")
 		os.Exit(1)
 	}
+
+	if !isElevated() {
+		fmt.Println("[*] Requesting administrator privileges...")
+		if err := restartAsAdmin(); err != nil {
+			fmt.Printf("[!] Failed to restart as admin: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	fmt.Println("[+] Running with elevated privileges")
+	fmt.Println()
+
+	fmt.Println("==========================================")
+	fmt.Println("      TPM Spoofer with Auto-Clear")
+	fmt.Println("==========================================")
+	fmt.Println()
+
+	fmt.Println("[*] Step 1: Capturing current TPM serial...")
+	oldSerial = getTPMSerial()
+	fmt.Printf("[+] Current TPM Serial: %s\n", oldSerial)
+	fmt.Println()
+
+	fmt.Println("[*] Step 2: Clearing TPM...")
+	if err := clearTPM(); err != nil {
+		fmt.Printf("[!] Warning: TPM clear failed: %v\n", err)
+		fmt.Println("[*] Continuing with spoofing anyway...")
+	}
+	fmt.Println()
+
+	fmt.Println("[*] Step 3: Generating new TPM identity...")
+	d := make([]byte, 32)
+	if _, err := rand.Read(d); err != nil {
+		fmt.Printf("[!] Failed to generate random data: %v\n", err)
+		os.Exit(1)
+	}
+	newSerial = hex.EncodeToString(d)
+	fmt.Printf("[+] New TPM Serial (hex): %s\n", newSerial)
+	fmt.Println()
 
 	mkrs := []string{"intel", "amd", "infineon", "nuvoton", "stmicro", "microsoft"}
 	var s [1]byte
@@ -515,21 +677,68 @@ func main() {
 		os.Exit(1)
 	}
 	mkr := mkrs[int(s[0])%len(mkrs)]
+	fmt.Printf("[+] Selected manufacturer: %s\n", mkr)
+	fmt.Println()
 
+	fmt.Println("[*] Step 4: Opening TPM connection...")
 	t, err := transport.OpenTPM()
 	if err != nil {
+		fmt.Printf("[!] Failed to open TPM: %v\n", err)
 		os.Exit(1)
 	}
 	defer t.Close()
+	fmt.Println("[+] TPM connection established")
+	fmt.Println()
 
+	fmt.Println("[*] Step 5: Updating TPM hierarchy security...")
 	updSec(t)
+	fmt.Println("[+] Security updated")
+	fmt.Println()
+
+	fmt.Println("[*] Step 6: Breaking lockout policy...")
 	_ = brkLck(t)
+	fmt.Println("[+] Lockout policy handled")
+	fmt.Println()
+
+	fmt.Println("[*] Step 7: Removing existing certificates...")
 	_ = rmCerts(t)
+	fmt.Println("[+] Certificates removed")
+	fmt.Println()
+
+	fmt.Println("[*] Step 8: Removing existing keys...")
 	_ = rmKeys(t)
+	fmt.Println("[+] Keys removed")
+	fmt.Println()
+
+	fmt.Println("[*] Step 9: Creating new TPM keys and certificates...")
 	_, _, err = doAll(t, d, mkr)
 	if err != nil {
+		fmt.Printf("[!] Failed to create keys: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("[+] New keys and certificates created")
+	fmt.Println()
+
+	fmt.Println("[*] Step 10: Extending PCR values...")
 	_ = extPcr(t, d)
+	fmt.Println("[+] PCR values extended")
+	fmt.Println()
+
+	fmt.Println("==========================================")
+	fmt.Println("           SPOOFING COMPLETE")
+	fmt.Println("==========================================")
+	fmt.Println()
+	fmt.Println("SERIAL INFORMATION:")
+	fmt.Printf("  OLD Serial: %s\n", oldSerial)
+	fmt.Printf("  NEW Serial: %s\n", newSerial)
+	fmt.Println()
+	fmt.Println("IMPORTANT:")
+	fmt.Println("  - TPM has been cleared and spoofed")
+	fmt.Println("  - NO automatic reboot has been performed")
+	fmt.Println("  - You MUST reboot your system for changes to take effect")
+	fmt.Println("  - After reboot, your system will use the new TPM identity")
+	fmt.Println()
+	fmt.Println("Press Enter to exit...")
+	fmt.Scanln()
 	os.Exit(0)
 }
